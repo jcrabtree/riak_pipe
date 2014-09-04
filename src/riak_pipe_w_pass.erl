@@ -35,6 +35,7 @@
 -record(state, {p :: riak_pipe_vnode:partition(),
                 fd :: riak_pipe_fitting:details()}).
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 %% @doc Initialization just stows the partition and fitting details in
 %%      the module's state, for sending outputs in {@link process/3}.
@@ -55,7 +56,7 @@ process(Input, _Last, #state{p=Partition, fd=FD}=State) ->
             {ok, State};
        true ->
             ?T(FD, [], {processing, Input}),
-            riak_pipe_vnode_worker:send_output(Input, Partition, FD),
+            ok = riak_pipe_vnode_worker:send_output(Input, Partition, FD),
             ?T(FD, [], {processed, Input}),
             {ok, State}
     end.

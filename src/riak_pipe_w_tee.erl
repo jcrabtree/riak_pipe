@@ -38,6 +38,7 @@
 -record(state, {p :: riak_pipe_vnode:partition(),
                 fd :: riak_pipe_fitting:details()}).
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 %% @doc Init just stashes the `Partition' and `FittingDetails' for later.
 -spec init(riak_pipe_vnode:partition(), riak_pipe_fitting:details()) ->
@@ -57,9 +58,9 @@ process(Input, _Last, #state{p=Partition, fd=FittingDetails}=State) ->
               #fitting{}=Fitting ->
                   Fitting
           end,
-    riak_pipe_vnode_worker:send_output(
-      Input, Partition, FittingDetails, Tee, infinity),
-    riak_pipe_vnode_worker:send_output(Input, Partition, FittingDetails),
+    ok = riak_pipe_vnode_worker:send_output(
+           Input, Partition, FittingDetails, Tee, infinity),
+    ok = riak_pipe_vnode_worker:send_output(Input, Partition, FittingDetails),
     {ok, State}.
 
 %% @doc Unused.

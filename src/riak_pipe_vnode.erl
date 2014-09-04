@@ -35,6 +35,7 @@
          handoff_finished/2,
          handle_handoff_data/2,
          encode_handoff_item/2,
+         request_hash/1,
          handle_exit/3,
          handle_info/2,
          handle_coverage/4]).
@@ -80,12 +81,12 @@
 -define(DEFAULT_WORKER_Q_LIMIT, 4096).
 -define(FORWARD_WORKER_MODULE, riak_pipe_w_fwd).
 
--record(worker_perf, {started :: calendar:t_now(),
+-record(worker_perf, {started :: erlang:timestamp(),
                        processed = 0 :: non_neg_integer(),
                        failures = 0 :: non_neg_integer(),
                        work_time = 0 :: non_neg_integer(),
                        idle_time = 0 :: non_neg_integer(),
-                       last_time :: calendar:t_now()}).
+                       last_time :: erlang:timestamp()}).
 -record(worker, {pid :: pid(),
                  fitting :: #fitting{},
                  details :: #fitting_details{},
@@ -112,9 +113,10 @@
                 worker_q_limit :: pos_integer(),
                 workers_archiving :: [#worker{}],
                 handoff :: undefined | starting | cancelled | finished
-                         | #handoff{}}).
+                         | resize | #handoff{}}).
 
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 -record(cmd_enqueue, {fitting :: #fitting{},
                       input :: term(),
@@ -313,12 +315,12 @@ remaining_preflist(Input, Hash, NVal, UsedPreflist) ->
     %% different vnodes to be available at different evaluations, so
     %% we have to check the length of UsedPreflist explicitly, instead
     %% of just expecting to filter all of the elements it contains
-    if length(UsedPreflist) < IntNVal ->
-            Preflist = riak_core_apl:get_apl(Hash, IntNVal, Ring, Nodes),
-            Preflist--UsedPreflist;
-       true ->
-            []
-    end.
+    Preflist = [{Idx, Node} || {{Idx, Node}, _Ann} <-
+                                   riak_core_apl:get_primary_apl(Hash,
+                                                                 IntNVal,
+                                                                 Ring,
+                                                                 Nodes)],
+    Preflist--UsedPreflist.
 
 %% @doc Do the actual sending of the work to the vnode, as well as
 %%      receiving the response.
@@ -329,26 +331,58 @@ queue_work_send(#fitting{ref=Ref}=Fitting,
                 Input, Timeout,
                 [{Index,Node}|_]=UsedPreflist) ->
     try riak_core_vnode_master:command_return_vnode(
-      {Index, Node},
-      #cmd_enqueue{fitting=Fitting, input=Input, timeout=Timeout,
-                   usedpreflist=UsedPreflist},
-      {raw, Ref, self()},
-      riak_pipe_vnode_master) of
+          {Index, Node},
+          #cmd_enqueue{fitting=Fitting, input=Input, timeout=Timeout,
+                       usedpreflist=UsedPreflist},
+          {raw, Ref, self()},
+          riak_pipe_vnode_master) of
         {ok, VnodePid} ->
-            %% monitor in case the vnode is gone before it
-            %% responds to this request
-            MonRef = erlang:monitor(process, VnodePid),
-            %% block until input confirmed queued, for backpressure
-            receive
-                {Ref, Reply} ->
-                    erlang:demonitor(MonRef),
-                    Reply;
-                {'DOWN',MonRef,process,VnodePid,Reason} ->
-                    {error, {vnode_down, Reason}}
-            end
+            queue_work_wait(Ref, Index, VnodePid);
+        {error, timeout} ->
+            {error, {vnode_proxy_timeout, {Index, Node}}}
     catch exit:{{nodedown, Node}, _GenServerCall} ->
             %% node died between services check and gen_server:call
             {error, {nodedown, Node}}
+    end.
+
+queue_work_wait(Ref, Index, VnodePid) ->
+    %% monitor in case the vnode is gone before it
+    %% responds to this request
+    MonRef = erlang:monitor(process, VnodePid),
+    %% block until input confirmed queued, for backpressure
+    receive
+        {Ref, Reply} ->
+            erlang:demonitor(MonRef),
+            Reply;
+        {'DOWN',MonRef,process,VnodePid,normal} ->
+            %% the vnode likely just shut down after completing handoff
+            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+            Next = case riak_core_ring:next_owner(Ring, Index) of
+                       {undefined, undefined, undefined} ->
+                           %% ownership finished changing before we asked
+                           %% ... check if Next==Node?
+                           riak_core_ring:index_owner(Ring, Index);
+                       {_From, To, _Status} ->
+                           %% ownership is still changing ... wait for
+                           %% the future owner
+                           To
+                   end,
+            %% monitor new vnode, since the input will be handled
+            %% there, instead of at the vnode originally contacted
+
+            %% On review of this code path, while it's possible
+            %% rpc:call can return {badrpc, _} or throw an error
+            %% exit:_, the supervision tree for riak_pipe_vnode will
+            %% not try and restart the process, so a crash in this
+            %% case is safe.
+            {ok, NextPid} = rpc:call(Next,
+                                     riak_core_vnode_master,
+                                     get_vnode_pid,
+                                     [Index, riak_pipe_vnode]),
+            queue_work_wait(Ref, Index, NextPid);
+        {'DOWN',MonRef,process,VnodePid,Reason} ->
+            %% the vnode died unexpectedly
+            {error, {vnode_down, Reason}}
     end.
 
 %% @doc Send end-of-inputs for a fitting to a vnode.  Note: this
@@ -455,7 +489,7 @@ status(Pid, Fittings) when is_list(Fittings); Fittings =:= all ->
     receive
         {Ref, Reply} -> Reply
     end.
-    
+
 
 %% @doc Handle a vnode command.
 -spec handle_command(term(), sender(), state()) ->
@@ -482,6 +516,9 @@ handle_command(Message, _Sender, State) ->
        | {forward, state()}.
 handle_handoff_command(?FOLD_REQ{}=Cmd, Sender, State) ->
     handoff_cmd_internal(Cmd, Sender, State);
+handle_handoff_command(#riak_core_fold_req_v1{}=Cmd, Sender, State) ->
+    handoff_cmd_internal(riak_core_util:make_newest_fold_req(Cmd),
+                         Sender, State);
 handle_handoff_command(#cmd_archive{}=Cmd, _Sender, State) ->
     archive_internal(Cmd, State);
 handle_handoff_command(#cmd_enqueue{fitting=F}=Cmd, Sender,
@@ -516,18 +553,26 @@ handle_handoff_command(Cmd, Sender, State) ->
     handle_command(Cmd, Sender, State).
 
 %% @doc Be prepared to handoff.
--spec handoff_starting(node(), state()) -> {true, state()}.
-handoff_starting(_TargetNode, State) ->
+-spec handoff_starting({atom(),{integer(),node()}}, state()) -> {true, state()}.
+handoff_starting({resize_transfer, _}, State) ->
+    {true, State#state{handoff=resize}};
+handoff_starting(_, State) ->
     {true, State#state{handoff=starting}}.
 
 %% @doc Stop handing off before getting started.
 -spec handoff_cancelled(state()) -> {ok, state()}.
+handoff_cancelled(#state{handoff=resize}=State) ->
+    {ok, State#state{handoff=cancelled}};
 handoff_cancelled(#state{handoff=starting, workers_archiving=[]}=State) ->
     %%TODO: handoff is only cancelled before anything is handed off, right?
     {ok, State#state{handoff=cancelled}}.
 
 %% @doc Note that handoff has completed.
 -spec handoff_finished(node(), state()) -> {ok, state()}.
+handoff_finished(_TargetNode, #state{handoff=resize}=State) ->
+    %% in the case of resize there may be workers because we lie and
+    %% don't really handoff anything
+    {ok, State#state{handoff=resize}};
 handoff_finished(_TargetNode, #state{workers=[]}=State) ->
     %% #state.workers should be empty, because they were all handed off
     %% clear out list of handed off items
@@ -566,12 +611,22 @@ encode_handoff_item(Fitting, {Queue, Blocking, Archive}) ->
 
 %% @doc Determine whether this vnode has any running workers.
 -spec is_empty(state()) -> {boolean(), state()}.
+is_empty(#state{handoff=resize}=State) ->
+    %% During ring resizing lie and say we are empty
+    %% this forces queues to remain local to this vnode (no handoff)
+    %% all processing continues in the current ring
+    {true, State};
 is_empty(#state{workers=Workers}=State) ->
     {Workers==[], State}.
 
+%% @doc Forward no requests during ring resizing
+request_hash(_) ->
+    undefined.
+
+
 %% @doc Unused.
 -spec delete(state()) -> {ok, state()}.
-delete(#state{workers=[]}=State) ->
+delete(State) ->
     %%TODO: delete is only called if is_empty/1==true, right?
     {ok, State}.
 
@@ -633,8 +688,8 @@ handle_info({'DOWN',_,process,Pid,_},
                           {vnode, {fitting_died, Partition}}),
                        %% if the fitting died, tear down its worker
                        erlang:unlink(Worker#worker.pid),
-                       riak_pipe_vnode_worker_sup:terminate_worker(
-                         WorkerSup, Worker#worker.pid),
+                       _ = riak_pipe_vnode_worker_sup:terminate_worker(
+                             WorkerSup, Worker#worker.pid),
                        remove_worker(Worker, State);
                    none ->
                        %% TODO: log this somewhere?
@@ -750,7 +805,7 @@ new_worker(Fitting, #state{partition=P, worker_sup=Sup, worker_q_limit=WQL}) ->
                 {ok, Pid} = riak_pipe_vnode_worker_sup:start_worker(
                               Sup, Details),
                 erlang:link(Pid),
-                Start = now(),
+                Start = os:timestamp(),
                 Perf = #worker_perf{started=Start, last_time=Start},
                 ?T(Details, [worker], {vnode, {start, P}}),
                 {ok, #worker{pid=Pid,
@@ -763,9 +818,8 @@ new_worker(Fitting, #state{partition=P, worker_sup=Sup, worker_q_limit=WQL}) ->
                              blocking=queue:new(),
                              perf=Perf}};
             gone ->
-                lager:error(
-                  "Pipe worker startup failed:"
-                  "fitting was gone before startup"),
+                lager:debug(
+                  "Fitting was gone before pipe worker startup"),
                 worker_startup_failed
         end
     catch Type:Reason ->
@@ -792,7 +846,7 @@ new_fwd_worker(FittingDetails,
     {ok, Pid} = riak_pipe_vnode_worker_sup:start_worker(
                   Sup, ForwardDetails),
     erlang:link(Pid),
-    Start = now(),
+    Start = os:timestamp(),
     Perf = #worker_perf{started=Start, last_time=Start},
     ?T(FittingDetails, [fwd_worker], {vnode, {start, P}}),
     {ok, #worker{pid=Pid,
@@ -932,7 +986,7 @@ next_input_nohandoff(WorkerUnperf, #state{partition=Partition}=State) ->
             send_input(Worker, {Input, UsedPreflist}),
             WorkingWorker = Worker#worker{state={working, Input},
                                           q=NewQ},
-            BlockingWorker = 
+            BlockingWorker =
                 case {queue:len(NewQ) < Worker#worker.q_limit,
                       queue:out(Worker#worker.blocking)} of
                     {true, {{value, {BlockInput, Blocker, BlockUsedPreflist}},
@@ -1049,8 +1103,8 @@ restart_worker(#worker{details=FD}=UnstatWorker,
             ?T(Worker#worker.details, [restart_fail],
                {vnode, {restart_fail, Partition, proplist_perf(Worker)}}),
             %% fail blockers, so they resubmit elsewhere
-            [ reply_to_blocker(Blocker, {error, worker_restart_fail})
-              || {_, Blocker, _} <- queue:to_list(Worker#worker.blocking) ],
+            _ = [ reply_to_blocker(Blocker, {error, worker_restart_fail})
+                  || {_, Blocker, _} <- queue:to_list(Worker#worker.blocking) ],
             %% spin up a stub worker to forward the inputs
             %% (don't want to tie up the vnode doing this sending)
             {ok, FwdWorker} = new_fwd_worker(Worker#worker.details,
@@ -1073,7 +1127,7 @@ restart_worker(#worker{details=FD, q=Queue}=Worker,
     %% this was a forwarding worker for a failed-restart fitting; if
     %% it crashed, there's something *really* wrong - log the errors
     %% and dump it
-    [ ?T_ERR(FD, {restart_dropped, I}) || I <- queue:to_list(Queue) ],
+    _ = [ ?T_ERR(FD, {restart_dropped, I}) || I <- queue:to_list(Queue) ],
     if Worker#worker.inputs_done ->
             %% tell the fitting this worker has exited, so it doesn't
             %% hang around waiting
@@ -1097,7 +1151,7 @@ worker_error(Reason, #worker{details=FD}=Worker, State) ->
 
 %% @doc Reply to a request that has been waiting in a worker's blocked
 %%      queue.
--spec reply_to_blocker(term(), term()) -> true.
+-spec reply_to_blocker(term(), term()) -> any().
 reply_to_blocker(Blocker, Reply) ->
     riak_core_vnode:reply(Blocker, Reply).
 
@@ -1149,7 +1203,7 @@ worker_detail(#worker{fitting=Fitting, details=Details,
 %%      should be called while its state is still set to `{working, A}'.
 -spec roll_perf(#worker{}) -> #worker{}.
 roll_perf(#worker{perf=Perf, state=State}=Worker) ->
-    Now = now(),
+    Now = os:timestamp(),
     Duration = timer:now_diff(Now, Perf#worker_perf.last_time),
     TimedPerf = case State of
                     {working,_} ->
@@ -1168,12 +1222,12 @@ roll_perf(#worker{perf=Perf, state=State}=Worker) ->
 inc_fail_perf(#worker{perf=Perf}=Worker) ->
     FailPerf = Perf#worker_perf{failures=1+Perf#worker_perf.failures},
     Worker#worker{perf=FailPerf}.
-    
+
 %% @doc Convert the worker's performance statistics to a proplist, for
 %%      sharing.
 -spec proplist_perf(#worker{}) -> [{atom(), term()}].
 proplist_perf(#worker{perf=Perf, state=State}) ->
-    SinceLast = timer:now_diff(now(), Perf#worker_perf.last_time),
+    SinceLast = timer:now_diff(os:timestamp(), Perf#worker_perf.last_time),
     {AddWork, AddIdle} = case State of
                              {working, _} -> {SinceLast, 0};
                              _            -> {0, SinceLast}

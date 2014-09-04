@@ -33,6 +33,7 @@
 -record(state, {p :: riak_pipe_vnode:partition(),
                 fd :: riak_pipe_fitting:details()}).
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 %% name of the table reMEMbering restarts
 -define(MEM, ?MODULE).
@@ -61,7 +62,7 @@ init(Partition, FittingDetails) ->
 
 is_restart(Partition, FittingDetails) ->
     Fitting = FittingDetails#fitting_details.fitting,
-    %% set the fitting process as the heir, such that the ets
+    %% set the fitting coordinator as the heir, such that the ets
     %% table survives when this worker exits, but gets cleaned
     %% up when the pipeline shuts down
     case (catch ets:new(?MEM, [set, {keypos, 1},
@@ -92,7 +93,7 @@ is_restart(Partition, FittingDetails) ->
 -spec process(term(), boolean(), state()) -> {ok, state()}.
 process(Input, _Last, #state{p=Partition, fd=FittingDetails}=State) ->
     ?T(FittingDetails, [], {processing, Input}),
-    case FittingDetails#fitting_details.arg of 
+    case FittingDetails#fitting_details.arg of
         Input ->
             if Input == init_restartfail ->
                     %% "worker restart failure, input forwarding" test in
@@ -108,16 +109,17 @@ process(Input, _Last, #state{p=Partition, fd=FittingDetails}=State) ->
         {recurse_done_pause, _} ->
             %% "restart after eoi" test in riak_pipe uses this
             %% behavior see done/1 for more details
-            case Input of
-                [_] -> ok;
-                [_|More] ->
-                    timer:sleep(100),
-                    riak_pipe_vnode_worker:recurse_input(
-                      More, Partition, FittingDetails)
-            end,
+            ok = case Input of
+                     [_] -> ok;
+                     [_|More] ->
+                         timer:sleep(100),
+                         riak_pipe_vnode_worker:recurse_input(
+                           More, Partition, FittingDetails)
+                 end,
             {ok, State};
         _Other ->
-            riak_pipe_vnode_worker:send_output(Input, Partition, FittingDetails),
+            ok = riak_pipe_vnode_worker:send_output(
+                   Input, Partition, FittingDetails),
             ?T(FittingDetails, [], {processed, Input}),
             {ok, State}
     end.
@@ -134,4 +136,3 @@ done(#state{fd=FittingDetails}) ->
         _ ->
             ok
     end.
-            

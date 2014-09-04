@@ -34,6 +34,14 @@
 -include("riak_pipe.hrl").
 -include("riak_pipe_debug.hrl").
 
+-ifdef(PULSE).
+-include_lib("pulse/include/pulse.hrl").
+%% have to transform the 'receive' of the work results
+-compile({parse_transform, pulse_instrument}).
+%% don't trasnform toplevel test functions
+-compile({pulse_replace_module,[{supervisor,pulse_supervisor}]}).
+-endif.
+
 -define(SERVER, ?MODULE).
 
 %%%===================================================================
@@ -46,7 +54,7 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc Start a new fitting under this supervisor.
+%% @doc Start a new fitting coordinator under this supervisor.
 -spec add_fitting(pid(),
                   riak_pipe:fitting_spec(),
                   riak_pipe:fitting(),
@@ -56,7 +64,7 @@ add_fitting(Builder, Spec, Output, Options) ->
     ?DPF("Adding fitting for ~p", [Spec]),
     supervisor:start_child(?SERVER, [Builder, Spec, Output, Options]).
 
-%% @doc Terminate a fitting immediately.  Useful for tearing down
+%% @doc Terminate a coordinator immediately.  Useful for tearing down
 %% pipelines that may be otherwise swamped with messages from
 %% restarting workers.
 -spec terminate_fitting(riak_pipe:fitting()) -> ok | {error, term()}.

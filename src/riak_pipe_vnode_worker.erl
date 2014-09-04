@@ -139,7 +139,6 @@
          send_output/3,
          send_output/4,
          send_output/5]).
--export([behaviour_info/1]).
 
 %% gen_fsm callbacks
 -export([
@@ -161,15 +160,18 @@
                 vnode :: pid(),
                 modstate :: term()}).
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
-%% @doc Get information about this behavior.
--spec behaviour_info(atom()) -> 'undefined' | [{atom(), arity()}].
-behaviour_info(callbacks) ->
-    [{init,2},
-     {process,3},
-     {done,1}];
-behaviour_info(_Other) ->
-    undefined.
+-type callback_state() :: term().
+
+-callback init(riak_pipe_vnode:partition(),
+               riak_pipe_fitting:details()) ->
+    {ok, callback_state()}.
+-callback process(term(), boolean(), callback_state()) ->
+    {ok, callback_state()} |
+    {forward_preflist, callback_state()} |
+    {{error, term()}, callback_state()}.
+-callback done(callback_state()) -> ok.
 
 %%%===================================================================
 %%% API
@@ -287,13 +289,12 @@ send_output(Output, FromPartition, Details, FittingOverride, Timeout) ->
                   riak_core_apl:preflist()) ->
          ok | {error, term()}.
 send_output(Output, FromPartition,
-            #fitting_details{name=Name}=_Details,
+            #fitting_details{name=Name, options=Opts}=_Details,
             FittingOverride,
             Timeout, UsedPreflist) ->
     case FittingOverride#fitting.chashfun of
         sink ->
-            riak_pipe_sink:result(Name, FittingOverride, Output),
-            ok;
+            riak_pipe_sink:result(Name, FittingOverride, Output, Opts);
         follow ->
             %% TODO: should 'follow' use the original preflist (in
             %%       case of failover)?

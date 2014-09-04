@@ -46,12 +46,21 @@
 -include("riak_pipe.hrl").
 -include("riak_pipe_debug.hrl").
 
+-ifdef(PULSE).
+-include_lib("pulse/include/pulse.hrl").
+%% have to transform the 'receive' of the work results
+-compile({parse_transform, pulse_instrument}).
+%% don't trasnform toplevel test functions
+-compile({pulse_replace_module,[{gen_fsm,pulse_gen_fsm}]}).
+-endif.
+
 -record(state, {options :: riak_pipe:exec_opts(),
                 pipe :: #pipe{},
                 alive :: [{#fitting{}, reference()}], % monitor ref
                 sinkmon :: reference()}). % monitor ref
 
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 %%%===================================================================
 %%% API
@@ -194,8 +203,9 @@ handle_info({'DOWN', Ref, process, Pid, Reason}, StateName,
                            StateName,
                            State#state{alive=Rest});
         false ->
-            if State#state.sinkmon == Ref,
-               ((State#state.pipe)#pipe.sink)#fitting.pid == Pid ->
+            case (State#state.sinkmon == Ref) andalso
+                (((State#state.pipe)#pipe.sink)#fitting.pid == Pid) of
+                true ->
                     %% the sink died - kill the pipe, since it has
                     %% nowhere to send its output
 
@@ -203,7 +213,7 @@ handle_info({'DOWN', Ref, process, Pid, Reason}, StateName,
                     %% should have generated its own error log, and a
                     %% normal sink exit should not generate spam.
                     {stop, normal, State};
-               true ->
+               false ->
                     %% this wasn't meant for us - ignore
                     {next_state, StateName, State}
             end
@@ -234,7 +244,7 @@ maybe_shutdown(Reason, _StateName, State) ->
 terminate(_Reason, _StateName, #state{alive=Alive}) ->
     %% this is a brutal kill of each fitting, just in case that fitting
     %% is otherwise swamped with stop/restart messages from its workers
-    [ riak_pipe_fitting_sup:terminate_fitting(F) || {F,_R} <- Alive ],
+    _ = [ _ = riak_pipe_fitting_sup:terminate_fitting(F) || {F,_R} <- Alive ],
     ok.
 
 %% @doc Unused.

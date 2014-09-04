@@ -27,6 +27,11 @@
 
 -include("riak_pipe.hrl").
 
+-export_type([trace_filter/0]).
+
+-type trace_filter() :: all | set() | trace_compiled().
+-type trace_compiled() :: ordsets:ordset(term()).
+
 %% @doc Log the given message, if logging is enabled, to the specified
 %%      log target.  Logging is enabled and directed via the `log'
 %%      option passed to {@link riak_pipe:exec/2}.  If the option was
@@ -43,9 +48,9 @@ log(#fitting_details{options=O, name=N}, Msg) ->
             ok; %% no logging
         sink ->
             Sink = proplists:get_value(sink, O),
-            riak_pipe_sink:log(N, Sink, Msg);
+            riak_pipe_sink:log(N, Sink, Msg, O);
         {sink, Sink} ->
-            riak_pipe_sink:log(N, Sink, Msg);
+            riak_pipe_sink:log(N, Sink, Msg, O);
         lager ->
             lager:info(
               "~s: ~P",
@@ -73,16 +78,25 @@ trace(#fitting_details{options=O, name=N}=FD, Types, Msg) ->
                       {true, all};
                   undefined ->
                       false;
+                  EnabledSet when is_list(EnabledSet) ->
+                      %% ordsets (post 1.2)
+                      find_enabled([N|Types], EnabledSet);
                   EnabledSet ->
-                      MatchSet = sets:from_list([node(),N|Types]),
-                      Intersection = sets:intersection(EnabledSet,
-                                                       MatchSet),
-                      case sets:size(Intersection) of
-                          0 -> false;
-                          _ -> {true, sets:to_list(Intersection)}
-                      end
+                      %% sets (1.2 and earlier)
+                      OS = ordsets:from_list(sets:to_list(EnabledSet)),
+                      find_enabled([N|Types], OS)
               end,
     case TraceOn of
         {true, Traces} -> log(FD, {trace, Traces, Msg});
         false          -> ok
+    end.
+
+-spec find_enabled(list(), trace_compiled()) ->
+         {true, list()} | false.
+find_enabled(Types, Enabled) ->
+    MatchSet = ordsets:from_list([node()|Types]),
+    Intersection = ordsets:intersection(Enabled, MatchSet),
+    case Intersection of
+        [] -> false;
+        _ -> {true, Intersection}
     end.

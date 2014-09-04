@@ -18,25 +18,19 @@
 %%
 %% -------------------------------------------------------------------
 
-%% @doc Supervisor for the pipe builder processes.
-%%
-%%      This supervisor is mostly convenience for later investigation,
-%%      to learn how many pipelines are active.  No restart strategy
-%%      is used.
--module(riak_pipe_builder_sup).
+%% @doc Support module for reduce_fitting_pulse tests - supervisor for
+%% fsm-style sink, like Riak KV uses.
+-module(reduce_fitting_pulse_sink_sup).
 
 -behaviour(supervisor).
 
 %% API
 -export([start_link/0]).
--export([new_pipeline/2,
-         pipelines/0,
-         builder_pids/0]).
+-export([start_sink/2,
+         terminate_sink/1]).
 
 %% Supervisor callbacks
 -export([init/1]).
-
--include("riak_pipe.hrl").
 
 -ifdef(PULSE).
 -include_lib("pulse/include/pulse.hrl").
@@ -46,58 +40,31 @@
 -compile({pulse_replace_module,[{supervisor,pulse_supervisor}]}).
 -endif.
 
--define(SERVER, ?MODULE).
-
 %%%===================================================================
 %%% API functions
 %%%===================================================================
 
-%% @doc Start the supervisor.  It will be registered under the atom
-%%      `riak_pipe_builder_sup'.
+%% @doc Start the supervisor.
 -spec start_link() -> {ok, pid()} | ignore | {error, term()}.
 start_link() ->
-    supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-%% @doc Start a new pipeline builder.  Starts the builder process
-%%      under this supervisor.
--spec new_pipeline([#fitting_spec{}], riak_pipe:exec_opts()) ->
-         {ok, Pipe::#pipe{}} | {error, Reason::term()}.
-new_pipeline(Spec, Options) ->
-    case supervisor:start_child(?MODULE, [Spec, Options]) of
-        {ok, Pid, Ref} ->
-            case riak_pipe_builder:pipeline(Pid) of
-                {ok, #pipe{sink=#fitting{ref=Ref}}=Pipe} ->
-                    riak_pipe_stat:update({create, Pid}),
-                    {ok, Pipe};
-                _ ->
-                    riak_pipe_stat:update(create_error),
-                    {error, startup_failure}
-            end;
-        Error ->
-            riak_pipe_stat:update(create_error),
-            Error
-    end.
+%% @doc Start a new worker under the supervisor.
+-spec start_sink(pid(), reference()) -> {ok, pid()}.
+start_sink(Owner, Ref) ->
+    supervisor:start_child(?MODULE, [Owner, Ref]).
 
-%% @doc Get the list of pipelines hosted on this node.
--spec pipelines() -> [#pipe{}].
-pipelines() ->
-    Children = builder_pids(),
-    Responses = [ riak_pipe_builder:pipeline(BuilderPid)
-                  || BuilderPid <- Children ],
-    %% filter out gone responses
-    [ P || {ok, #pipe{}=P} <- Responses ].
-
-%% @doc Get information about the builders supervised here.
--spec builder_pids() -> [term()].
-builder_pids() ->
-    [ Pid || {_, Pid, _, _} <- supervisor:which_children(?SERVER) ].
+%% @doc Stop a worker immediately
+-spec terminate_sink(pid()) -> ok | {error, term()}.
+terminate_sink(Sink) ->
+    supervisor:terminate_child(?MODULE, Sink).
 
 %%%===================================================================
 %%% Supervisor callbacks
 %%%===================================================================
 
-%% @doc Initialize this supervisor.  This is a `simple_one_for_one',
-%%      whose child spec is for starting `riak_pipe_builder' FSMs.
+%% @doc Initialize the supervisor.  This is a `simple_one_for_one',
+%% whose child spec is for starting `riak_kv_mrc_sink' FSMs.
 -spec init([]) -> {ok, {{supervisor:strategy(),
                          pos_integer(),
                          pos_integer()},
@@ -110,13 +77,14 @@ init([]) ->
     SupFlags = {RestartStrategy, MaxRestarts, MaxSecondsBetweenRestarts},
 
     Restart = temporary,
-    Shutdown = brutal_kill,
+    Shutdown = 2000,
     Type = worker,
 
-    Child = {undefined, {riak_pipe_builder, start_link, []},
-             Restart, Shutdown, Type, [riak_pipe_builder]},
+    AChild = {undefined, % no registered name
+              {reduce_fitting_pulse_sink, start_link, []},
+              Restart, Shutdown, Type, [reduce_fitting_pulse_sink]},
 
-    {ok, {SupFlags, [Child]}}.
+    {ok, {SupFlags, [AChild]}}.
 
 %%%===================================================================
 %%% Internal functions

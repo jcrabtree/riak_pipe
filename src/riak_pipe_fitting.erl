@@ -18,9 +18,9 @@
 %%
 %%--------------------------------------------------------------------
 
-%% @doc The process that hold the details for the fitting.  This
-%%      process also manages the end-of-inputs synchronization for
-%%      this stage of the pipeline.
+%% @doc The coordinator process that hold the details for the fitting.
+%%      This process also manages the end-of-inputs synchronization
+%%      for this stage of the pipeline.
 -module(riak_pipe_fitting).
 
 -behaviour(gen_fsm).
@@ -33,9 +33,6 @@
          workers/1]).
 -export([validate_fitting/1,
          format_name/1]).
--ifdef(TEST).
--export([crash/2]).
--endif.
 
 %% gen_fsm callbacks
 -export([init/1,
@@ -51,6 +48,18 @@
 -include("riak_pipe_log.hrl").
 -include("riak_pipe_debug.hrl").
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-ifdef(PULSE).
+-include_lib("pulse/include/pulse.hrl").
+%% have to transform the 'receive' of the work results
+-compile({parse_transform, pulse_instrument}).
+%% don't trasnform toplevel test functions
+-compile({pulse_replace_module,[{gen_fsm,pulse_gen_fsm}]}).
+-endif.
+
 -record(worker, {partition :: riak_pipe_vnode:partition(),
                  pid :: pid(),
                  monitor :: reference()}).
@@ -61,16 +70,16 @@
 
 -opaque state() :: #state{}.
 
--export_type([details/0]).
+-export_type([state/0, details/0]).
 -type details() :: #fitting_details{}.
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-%% @doc Start the fitting, according to the `Spec' given.  The fitting
-%%      will register with `Builder' and will request its outputs to
-%%      be processed under the `Output' fitting.
+%% @doc Start the coordinator, according to the `Spec' given.  The
+%%      coordinator will register with `Builder' and will request its
+%%      outputs to be processed under the `Output' fitting.
 -spec start_link(pid(),
                  riak_pipe:fitting_spec(),
                  riak_pipe:fitting(),
@@ -84,60 +93,65 @@ start_link(Builder, Spec, Output, Options) ->
             Error
     end.
 
-%% @doc Send an end-of-inputs message to the specified fitting process.
+%% @doc Send an end-of-inputs message to the specified coordinator.
 -spec eoi(riak_pipe:fitting()) -> ok.
 eoi(#fitting{pid=Pid, ref=Ref, chashfun=C}) when C =/= sink ->
     gen_fsm:send_event(Pid, {eoi, Ref}).
 
 %% @doc Request the details about this fitting.  The ring partition
 %%      index of the vnode requesting the details is included such
-%%      that the fitting can inform the vnode of end-of-inputs later.
+%%      that the coordinator can inform the vnode of end-of-inputs later.
 %%      This function assumes that it is being called from the vnode
-%%      process, so the `self()' can be used to give the fitting
+%%      process, so the `self()' can be used to give the coordinator
 %%      a pid to monitor.
 -spec get_details(riak_pipe:fitting(), riak_pipe_vnode:partition()) ->
          {ok, details()} | gone.
 get_details(#fitting{pid=Pid, ref=Ref}, Partition) ->
     try
         gen_fsm:sync_send_event(Pid, {get_details, Ref, Partition, self()})
-    catch exit:{noproc,_} ->
+    catch exit:_ ->
+            %% catching all exit types here , since we don't care
+            %% whether the coordinator was gone before we asked ('noproc')
+            %% or if it went away before responding ('normal' or other
+            %% exit reason)
             gone
     end.
 
-%% @doc Tell the fitting that this worker is done.  This function
+%% @doc Tell the coordinator that this worker is done.  This function
 %%      assumes that it is being called from the vnode process, so
-%%      that `self()' can be used to inform the fitting of which
+%%      that `self()' can be used to inform the coordinator of which
 %%      worker is done.
 -spec worker_done(riak_pipe:fitting()) -> ok | gone.
 worker_done(#fitting{pid=Pid, ref=Ref}) ->
     try
         gen_fsm:sync_send_event(Pid, {done, Ref, self()})
     catch exit:_ ->
+            %% catching all exit types here , since we don't care
+            %% whether the coordinator was gone before we asked ('noproc')
+            %% or if it went away before responding ('normal' or other
+            %% exit reason)
             gone
     end.
 
 %% @doc Get the list of ring partition indexes (vnodes) that are doing
-%%      work for this fitting.
+%%      work for this coordinator.
 -spec workers(pid()) -> {ok, [riak_pipe_vnode:partition()]} | gone.
 workers(Fitting) ->
-    try 
+    try
         {ok, gen_fsm:sync_send_all_state_event(Fitting, workers)}
-    catch exit:{noproc, _} ->
+    catch exit:_ ->
+            %% catching all exit types here , since we don't care
+            %% whether the coordinator was gone before we asked ('noproc')
+            %% or if it went away before responding ('normal' or other
+            %% exit reason)
             gone
     end.
-
--ifdef(TEST).
-crash(#fitting{pid=Pid}, Fun) ->
-    gen_fsm:sync_send_all_state_event(Pid, {test_crash, Fun});
-crash(Pid, Fun) ->
-    gen_fsm:sync_send_all_state_event(Pid, {test_crash, Fun}).
--endif.
 
 %%%===================================================================
 %%% gen_fsm callbacks
 %%%===================================================================
 
-%% @doc Initialize the fitting process.  This function monitors the
+%% @doc Initialize the coordinator.  This function monitors the
 %%      builder process, so it will tear down if the builder exits.
 -spec init([pid() | riak_pipe:fitting_spec() | riak_pipe:fitting()
             | riak_pipe:exec_opts()]) ->
@@ -154,7 +168,7 @@ init([Builder,
                                output=Output,
                                options=Options,
                                q_limit=QLimit},
-    
+
     ?T(Details, [], {fitting, init_started}),
 
     erlang:monitor(process, Builder),
@@ -169,12 +183,12 @@ init([Builder,
      #state{builder=Builder, details=Details, workers=[],
             ref=Output#fitting.ref}}.
 
-%% @doc The fitting is just hanging out, serving details and waiting
+%% @doc The coordinator is just hanging out, serving details and waiting
 %%      for end-of-inputs.
 %%
 %%      When it gets eoi, it forwards the signal to its workers, and
 %%      then begins waiting for them to respond done.  If it has no
-%%      workers when it receives end-of-inputs, the fitting stops
+%%      workers when it receives end-of-inputs, the coordinator stops
 %%      immediately.
 -spec wait_upstream_eoi(eoi, state()) ->
          {stop, normal, state()}
@@ -202,23 +216,23 @@ wait_upstream_eoi({eoi, Ref},
 wait_upstream_eoi({eoi, Ref},
                   #state{ref=Ref, workers=Workers, details=Details}=State) ->
     ?T(Details, [eoi], {fitting, receive_eoi}),
-    [ riak_pipe_vnode:eoi(Pid, Details#fitting_details.fitting)
-      || #worker{pid=Pid} <- Workers ],
+    _ = [ riak_pipe_vnode:eoi(Pid, Details#fitting_details.fitting)
+          || #worker{pid=Pid} <- Workers ],
     {next_state, wait_workers_done, State};
 wait_upstream_eoi(_, State) ->
     %% unknown message - ignore
     {next_state, wait_upstream_eoi, State}.
 
 
-%% @doc The fitting is just hanging out, serving details and waiting
+%% @doc The coordinator is just hanging out, serving details and waiting
 %%      for end-of-inputs.
 %%
-%%      When it gets a request for the fitting's details, it sets up
+%%      When it gets a request for the fitting details, it sets up
 %%      a monitor for the working vnode, and responds with details.
 %%
-%%      The fitting may receive a `done' message from a vnode before
+%%      The coordinator may receive a `done' message from a vnode before
 %%      eoi has been sent, if handoff causes the worker to relocate.
-%%      In this case, the fitting simply demonitors the vnode, and
+%%      In this case, the coordinator simply demonitors the vnode, and
 %%      removes it from its worker list.
 -spec wait_upstream_eoi({get_details, riak_pipe_vnode:partition(), pid()},
                         term(), state()) ->
@@ -249,16 +263,16 @@ wait_upstream_eoi(_, _, State) ->
     %% unknown message - reply {error, unknown} to get rid of it
     {reply, {error, unknown}, wait_upstream_eoi, State}.
 
-%% @doc The fitting has forwarded the end-of-inputs signal to all of
+%% @doc The coordinator has forwarded the end-of-inputs signal to all of
 %%      the vnodes working for it, and is waiting for done responses.
 %%
-%%      When the fitting receives a done response, it demonitors the
-%%      vnode that sent it, and removes it from its worker list.
-%%      If there are no more responses to wait for, the fitting
-%%      forwards the end-of-inputs signal to the fitting that follows,
-%%      and then shuts down normally.
+%%      When the coordinator receives a done response, it demonitors
+%%      the vnode that sent it, and removes it from its worker list.
+%%      If there are no more responses to wait for, the coordinator
+%%      forwards the end-of-inputs signal to the coordinator for the
+%%      next fitting in the pipe, and then shuts down normally.
 %%
-%%      If the fitting receives a request for details from a vnode
+%%      If the coordinator receives a request for details from a vnode
 %%      while in this state, it responds with the detail as usual,
 %%      but also immediately sends end-of-inputs to that vnode.
 -spec wait_workers_done({get_details, riak_pipe_vnode:partition(), pid()},
@@ -307,8 +321,8 @@ handle_event(_Event, StateName, State) ->
 
 %% @doc The only sync event handled in all states is `workers', which
 %%      retrieves a list of ring partition indexes that have requested
-%%      this fittings details (i.e. that are doing work for this
-%%      fitting).
+%%      the fitting details (i.e. that are doing work for this
+%%      coordinator).
 -spec handle_sync_event(workers, term(), atom(), state()) ->
          {reply, [riak_pipe_vnode:partition()], atom(), state()}.
 handle_sync_event(workers, _From, StateName, #state{workers=Workers}=State) ->
@@ -316,6 +330,7 @@ handle_sync_event(workers, _From, StateName, #state{workers=Workers}=State) ->
     {reply, Partitions, StateName, State};
 handle_sync_event({test_crash, Fun},_,_,_) ->
     %% Only test-enabled client sends this.
+    %% See riak_test's rt_pipe:crash_fitting/2 and pipe_verify_* tests
     Fun();
 handle_sync_event(_Event, _From, StateName, State) ->
     Reply = ok,
@@ -326,7 +341,7 @@ handle_sync_event(_Event, _From, StateName, State) ->
 %%      'DOWN' messages are received when monitored vnodes exit.  In
 %%      that case, the vnode is removed from the worker list.  If that
 %%      was also the last vnode we were waiting on a `done' message
-%%      from, also forward `eoi' and shut down the fitting.
+%%      from, also forward `eoi' and shut down the coordinator.
 -spec handle_info({'DOWN', reference(), term(), term(), term()},
                   atom(), state()) ->
          {next_state, atom(), state()}
@@ -341,7 +356,7 @@ handle_info({'DOWN', Ref, _, _, _}, StateName, State) ->
         {value, Worker, Rest} ->
             ?T(State#state.details, [done, 'DOWN'],
                {vnode_failure, Worker#worker.partition}),
-            %% check whether this fitting was just waiting on a final
+            %% check whether this coordinator was just waiting on a final
             %% 'done' and stop if so (because anything left in that
             %% vnode's worker queue is lost)
             case {StateName, Rest} of
@@ -373,8 +388,8 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-%% @doc Construct a #fitting{} record, given this fitting's pid spec,
-%%      and output.
+%% @doc Construct a #fitting{} record, given this coordinator's pid,
+%%      its fitting spec, and output destination.
 -spec fitting_record(pid(),
                      Spec::riak_pipe:fitting_spec(),
                      Output::riak_pipe:fitting()) ->
@@ -384,13 +399,13 @@ fitting_record(Pid,
                #fitting{ref=Ref}) ->
     #fitting{pid=Pid, ref=Ref, chashfun=HashFun, nval=NVal}.
 
-%% @doc Send the end-of-inputs signal to the next fitting.
+%% @doc Send the end-of-inputs signal to the next coordinator.
 -spec forward_eoi(state()) -> ok.
 forward_eoi(#state{details=Details}) ->
     ?T(Details, [eoi], {fitting, send_eoi}),
     case Details#fitting_details.output of
         #fitting{chashfun=sink}=Sink ->
-            riak_pipe_sink:eoi(Sink);
+            riak_pipe_sink:eoi(Sink, Details#fitting_details.options);
         #fitting{}=Fitting ->
             riak_pipe_fitting:eoi(Fitting)
     end.
@@ -580,3 +595,46 @@ is_iolist(Name) when is_integer(Name), Name >= 0, Name =< 255 ->
     true;
 is_iolist(_) ->
     false.
+
+-ifdef(TEST).
+validate_test_() ->
+    [{"very bad fitting",
+      %% undefined name because it's not a fitting_spec
+      ?_assertMatch({badarg, undefined, _Msg},
+                    (catch riak_pipe_fitting:validate_fitting(x)))},
+     {"bad fitting module",
+      ?_assertMatch({badarg, empty_pass, _Msg},
+                    (catch riak_pipe_fitting:validate_fitting(
+                             #fitting_spec{name=empty_pass,
+                                           module=does_not_exist})))},
+     {"bad fitting argument",
+      ?_assertMatch({badarg, empty_pass, _Msg},
+                    (catch riak_pipe_fitting:validate_fitting(
+                             #fitting_spec{name=empty_pass,
+                                           module=riak_pipe_w_reduce,
+                                           arg=bogus_arg})))},
+     {"good partfun",
+      ?_assertEqual(ok,
+                    (catch
+                         riak_pipe_fitting:validate_fitting(
+                           #fitting_spec{name=empty_pass,
+                                         module=riak_pipe_w_pass,
+                                         chashfun=follow})))},
+     {"bad partfun",
+      ?_assertMatch({badarg, empty_pass, _Msg},
+                    (catch riak_pipe_fitting:validate_fitting(
+                             #fitting_spec{name=empty_pass,
+                                           module=riak_pipe_w_pass,
+                                           chashfun=fun(_,_) -> 0 end})))},
+     {"format_name binary",
+      ?_assertEqual(<<"foo">>,
+                    riak_pipe_fitting:format_name(<<"foo">>))},
+     {"format_name string",
+      ?_assertEqual("foo",
+                    riak_pipe_fitting:format_name("foo"))},
+     {"format_name atom",
+      ?_assertEqual("[foo]",
+                    lists:flatten(riak_pipe_fitting:format_name([foo])))}
+     ].
+
+-endif.
